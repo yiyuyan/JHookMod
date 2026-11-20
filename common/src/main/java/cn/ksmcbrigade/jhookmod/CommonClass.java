@@ -17,7 +17,7 @@ public class CommonClass {
         Constants.LOG.info("JVMTI ClassFileLoadHook: injected={}, invocations so far={}",
                 FFMUtils.isInjected(), FFMUtils.getHookInvocations());
 
-        if (Services.PLATFORM.isDevelopmentEnvironment()) {
+        if (Services.PLATFORM.isDevelopmentEnvironment() || Boolean.getBoolean("jhook.selftest")) {
             JvmTIAgentTest.hookFooAndTest();
 
             // Repeatable API self-test (visibility matrix, signatures, overloads, JIT, backup...).
@@ -27,25 +27,27 @@ public class CommonClass {
             Constants.LOG.info("[JHook] fresh cross-class call site foo() returned {} -> {}",
                     crossClass, crossClass == 2 ? "PASS" : "FAIL");
 
-            // 例 1：System.exit 改成强制 halt(0)。目标 public static，hook 也必须 static。
-            installHook(System.class, "exit", new Class<?>[]{int.class},
-                    "exitForceZero", new Class<?>[]{int.class}, false);
 
-            // 例 2：窗口标题。updateTitle 是 public，普通 hook 即可稳定工作。
-            // installHook(Minecraft.class, "updateTitle", new Class<?>[0],
-            //         "createTitleHookTest", new Class<?>[0], false);
-
-            // 实验：createTitle 是 private 实例方法，走 hookNonPublic（常量池副本方案）。
-            installHook(Minecraft.class, "createTitle", new Class<?>[0],
-                    "createTitleHookTestStr", new Class<?>[0], true);
-
-            // 关于 createTitle（private 实例方法）的实验结论，需要时把下面这段放开：
-            //   installHook(Minecraft.class, "createTitle", new Class<?>[0],
-            //           "createTitleHookTestStr", new Class<?>[0], true);
-            // hookNonPublic 会把 hook 常量池的 pool_holder 改成 Minecraft，从而骗过 private 访问检查
-            // （实测报错点从 createTitle 转移到 hook 自身对 private 成员的访问），但随后 JVM 会
-            // 出现 EXCEPTION_ACCESS_VIOLATION。注意事项见 JHookUtils#hookNonPublic 的注释。
         }
+
+        // 例 1：System.exit 改成强制 halt(0)。目标 public static，hook 也必须 static。
+        installHook(System.class, "exit", new Class<?>[]{int.class},
+                "exitForceZero", new Class<?>[]{int.class}, false);
+
+        // 例 2：窗口标题。updateTitle 是 public，普通 hook 即可稳定工作。
+        // installHook(Minecraft.class, "updateTitle", new Class<?>[0],
+        //         "createTitleHookTest", new Class<?>[0], false);
+
+        // 实验：createTitle 是 private 实例方法，走 hookNonPublic（常量池副本方案）。
+        installHook(Minecraft.class, "createTitle", new Class<?>[0],
+                "createTitleHookTestStr", new Class<?>[0], true);
+
+        // 关于 createTitle（private 实例方法）的实验结论，需要时把下面这段放开：
+        //   installHook(Minecraft.class, "createTitle", new Class<?>[0],
+        //           "createTitleHookTestStr", new Class<?>[0], true);
+        // hookNonPublic 会把 hook 常量池的 pool_holder 改成 Minecraft，从而骗过 private 访问检查
+        // （实测报错点从 createTitle 转移到 hook 自身对 private 成员的访问），但随后 JVM 会
+        // 出现 EXCEPTION_ACCESS_VIOLATION。注意事项见 JHookUtils#hookNonPublic 的注释。
     }
 
     private static void installHook(Class<?> targetClazz, String targetName, Class<?>[] targetParams,
@@ -53,6 +55,7 @@ public class CommonClass {
         try {
             Method original = targetClazz.getDeclaredMethod(targetName, targetParams);
             Method hook = CommonClass.class.getDeclaredMethod(hookName, hookParams);
+            JHookUtils.probeMethodLayout(targetClazz, original);
             if (unsafe) {
                 JHookUtils.hookNonPublic(targetClazz, original, CommonClass.class, hook);
             } else {
@@ -66,11 +69,11 @@ public class CommonClass {
 
     /**
      * 与 {@code System.exit(int)} 同描述符、同为 static。
-     * <p>跨类拿不到原版实现，所以直接用 {@code halt(0)} 达成「强制以 0 退出」。</p>
+     * <p>跨类拿不到原版实现，所以直接用 {@code halt(114514)} 达成「强制以 114514 退出」。</p>
      */
     public static void exitForceZero(int status) {
-        Constants.LOG.info("[JHook] System.exit({}) rewritten to Runtime.halt(0)", status);
-        Runtime.getRuntime().halt(0);
+        Constants.LOG.info("[JHook] System.exit({}) rewritten to Runtime.halt(114514)", status);
+        Runtime.getRuntime().halt(114514);
     }
 
     /**

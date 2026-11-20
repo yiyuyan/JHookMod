@@ -423,6 +423,16 @@ public final class FFMUtils {
      * <p>注意：这是被 JVM 原生代码直接调用的 upcall 桩，任何逃逸的异常都会导致进程 abort，
      * 因此整个方法体必须包在 try/catch 里。</p>
      */
+    /**
+     * 回调出口：{@code (internalName, jclass)}。JHookUtils 用它把「正在被重定义」的类
+     * 立刻提升为全局引用。
+     *
+     * <p>为什么只有这个时机安全：{@code class_being_redefined} 的 handle 属于 **VM 的回调帧**，
+     * 回调返回前一直有效；而 FFM 每次下行调用都是独立原生入口，从别处拿到的 handle
+     * 一旦跨调用就失效。所以这是唯一能合法 {@code NewGlobalRef} 的地方。</p>
+     */
+    public static volatile java.util.function.BiConsumer<String, Long> REDEFINE_SINK;
+
     static void classFileLoadHook(
             MemorySegment jvmtiEnv, MemorySegment jniEnv,
             MemorySegment classBeingRedefined, MemorySegment loader,
@@ -432,6 +442,20 @@ public final class FFMUtils {
 
         // 计数必须放在短路检查之前，否则没有转换器时无法确认回调是否被调用。
         HOOK_INVOCATIONS.incrementAndGet();
+
+        // 在最早的短路之前：重定义回调是唯一能安全提升 class handle 的时机。
+        if (REDEFINE_SINK != null
+                && !classBeingRedefined.equals(MemorySegment.NULL)
+                && !name.equals(MemorySegment.NULL)) {
+            try {
+                String internal = name.reinterpret(Long.MAX_VALUE).getString(0);
+                if (!internal.isEmpty()) {
+                    REDEFINE_SINK.accept(internal, classBeingRedefined.address());
+                }
+            } catch (Throwable ignored) {
+                // upcall 边界内绝不能抛出
+            }
+        }
 
         // 最快的拒绝路径：没注册转换器就什么都不做，避免为每个类付出代价。
         if (TRANSFORMERS.isEmpty() || IN_HOOK.get()) {

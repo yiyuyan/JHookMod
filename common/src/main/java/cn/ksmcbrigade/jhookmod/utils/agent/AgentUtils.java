@@ -1,5 +1,6 @@
 package cn.ksmcbrigade.jhookmod.utils.agent;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
@@ -9,6 +10,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.lang.instrument.Instrumentation;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.jar.*;
 
@@ -26,7 +28,9 @@ public class AgentUtils {
 
         byte[] classBytes = generateClassBytes(fullClassName);
 
-        File jarFile = Path.of(System.getProperty("java.io.tmpdir"),
+        Path tmp = Path.of(System.getProperty("user.dir")).resolve("tmp_agents");
+        Files.createDirectories(tmp);
+        File jarFile = tmp.resolve(
                 RandomStringUtils.randomNumeric(12) + ".jar").toFile();
 
         try (JarOutputStream jos = new JarOutputStream(new FileOutputStream(jarFile))) {
@@ -105,6 +109,7 @@ public class AgentUtils {
         File file = createAgent();
         UnsafeUtils.loadAgent(file.getAbsolutePath());
         file.deleteOnExit();
+        FileUtils.forceDeleteOnExit(file);
         return getInst();
     }
 

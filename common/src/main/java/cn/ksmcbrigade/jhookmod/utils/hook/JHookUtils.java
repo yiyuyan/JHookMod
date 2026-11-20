@@ -1,6 +1,7 @@
 package cn.ksmcbrigade.jhookmod.utils.hook;
 
 import cn.ksmcbrigade.jhookmod.Constants;
+import cn.ksmcbrigade.jhookmod.utils.agent.AgentUtils;
 import cn.ksmcbrigade.jhookmod.utils.agent.UnsafeUtils;
 
 import java.lang.foreign.Arena;
@@ -51,6 +52,38 @@ public final class JHookUtils {
 
     private static final Map<String, HookRecord> RECORDS = new ConcurrentHashMap<>();
 
+    private static boolean instrumentationTried;
+    private static volatile java.lang.instrument.Instrumentation instrumentation;
+
+    /**
+     * Lazily obtains an {@link java.lang.instrument.Instrumentation} from a generated temp agent.
+     *
+     * <p>Why it matters: {@code Instrumentation.retransformClasses(Class...)} takes {@code Class}
+     * objects, so triggering a retransform no longer needs a {@code jclass}. That is what lets us
+     * break the circular dependency "retransform needs a handle, the safe handle needs a
+     * retransform".</p>
+     */
+    static java.lang.instrument.Instrumentation instrumentation() {
+        if (instrumentationTried) {
+            return instrumentation;
+        }
+        synchronized (JHookUtils.class) {
+            if (instrumentationTried) {
+                return instrumentation;
+            }
+            instrumentationTried = true;
+            try {
+                instrumentation = cn.ksmcbrigade.jhookmod.utils.agent.AgentUtils.injectTmpAgent();
+                Constants.LOG.info("[JHook] Instrumentation acquired: {}", instrumentation != null);
+            } catch (Throwable t) {
+                Constants.LOG.warn("[JHook] failed to acquire Instrumentation; "
+                        + "falling back to the JVMTI retransform path", t);
+                instrumentation = null;
+            }
+        }
+        return instrumentation;
+    }
+
     /** 关闭 deopt 的排查开关：{@code -Djhook.noDeopt=true}。 */
     private static final boolean DEOPT = !Boolean.getBoolean("jhook.noDeopt");
 
@@ -86,6 +119,80 @@ public final class JHookUtils {
      * <p><b>使用约束</b>：hook 方法体只能引用 public 成员或编译期常量——它的引用会按
      * 「从目标类发起」检查可见性。</p>
      */
+    private static boolean typeDumped;
+
+    /**
+     * Read-only diagnostic: dumps the HotSpot field layout of one method and the values found
+     * there. Nothing is written, so it is safe on a live process.
+     *
+     * <p>Used to find where {@code Method::_flags} lives and which bits are set, before deciding
+     * how to stop the JIT from compiling swapped methods.</p>
+     */
+    public static void probeMethodLayout(Class<?> clazz, Method method) {
+        try {
+            Natives n = Natives.get();
+            long addr = n.methodAddress(clazz, method);
+            if (!typeDumped) {
+                typeDumped = true;
+                n.probeCapabilities();
+                Constants.LOG.info("[JHookProbe] Method layout: {}", n.fieldDump("Method"));
+                Constants.LOG.info("[JHookProbe] ConstMethod layout: {}", n.fieldDump("ConstMethod"));
+            }
+            Constants.LOG.info("[JHookProbe] {}.{} Method*=0x{}",
+                    clazz.getName(), method.getName(), Long.toHexString(addr));
+
+            dumpFields(n, "Method", addr, new String[]{
+                    "_constMethod", "_constants", "_access_flags", "_flags",
+                    "_code", "_i2i_entry", "_from_compiled_entry", "_from_interpreted_entry",
+                    "_vtable_index", "_method_size", "_intrinsic_id"});
+
+            long constMethod = n.readPtr(addr + n.offset("Method", "_constMethod"));
+            Constants.LOG.info("[JHookProbe]   ConstMethod*=0x{}", Long.toHexString(constMethod));
+            dumpFields(n, "ConstMethod", constMethod, new String[]{
+                    "_constants", "_name_index", "_signature_index",
+                    "_flags", "_max_stack", "_max_locals", "_size", "_code_size"});
+        } catch (Throwable t) {
+            Constants.LOG.warn("[JHookProbe] failed for {}.{}", clazz.getName(), method.getName(), t);
+        }
+    }
+
+    /** Read-only probe: locate {@code jvmtiCapabilities} inside the JVMTI env. */
+    public static void probeCapabilities() {
+        try {
+            Natives.get().probeCapabilities();
+        } catch (Throwable t) {
+            Constants.LOG.warn("[JHookProbe] capability probe unavailable", t);
+        }
+    }
+
+    private static void dumpFields(Natives n, String type, long base, String[] fields) {
+        for (String field : fields) {
+            // 逐字段独立容错：指针字段按 8 字节对齐读，整型字段按 4 字节对齐读。
+            // 有些字段（如 Method::_access_flags）偏移不是 8 的倍数，用 readPtr 会因对齐失败。
+            long offset;
+            try {
+                offset = n.offset(type, field);
+            } catch (Throwable absent) {
+                Constants.LOG.info("[JHookProbe]   {}::{} <absent from VMStructs>", type, field);
+                continue;
+            }
+            String pointer;
+            try {
+                pointer = "0x" + Long.toHexString(n.readPtr(base + offset));
+            } catch (Throwable unaligned) {
+                pointer = "<unaligned>";
+            }
+            String value;
+            try {
+                int raw = n.readInt(base + offset);
+                value = raw + " (" + Integer.toBinaryString(raw) + ")";
+            } catch (Throwable unaligned) {
+                value = "<unaligned>";
+            }
+            Constants.LOG.info("[JHookProbe]   {}::{} off={} ptr={} int={}", type, field, offset, pointer, value);
+        }
+    }
+
     public static void hookNonPublic(Class<?> originalClazz, Method originalM,
                                      Class<?> hookClazz, Method hookM) {
         hookImpl(originalClazz, originalM, hookClazz, hookM, null, null, true);
@@ -133,6 +240,9 @@ public final class JHookUtils {
             // 否则它的 nmethod 会绕过 _constMethod。
             if (DEOPT) {
                 long probe = n.methodAddress(originalClazz, originalM);
+                // 注意：不要改用「清 _code + 重置 _from_compiled_entry」来 deopt。
+                // 实测（26.2 / JDK 25）会让已编译的调用方跳进失效的 nmethod，返回值变成垃圾值，
+                // 比「hook 不生效」危险得多。releaseCompiledCode 因此只在显式调用时才用。
                 boolean firstTime = RETRANSFORMED_CLASSES.add(originalClazz);
                 if (firstTime || n.isCompiled(probe)) {
                     n.deoptimize(originalClazz);
@@ -145,8 +255,14 @@ public final class JHookUtils {
             // 跨类 Hook 非 public 方法时，链接期的访问检查会用 method_holder 判断可见性，
             // 而 method_holder = _constMethod->_constants->pool_holder，换完 ConstMethod 后
             // 它会变成 hook 所在的类，检查必然失败。
+            // 访问标志不再读 Method::_access_flags：JDK 24+ 重构过 AccessFlags，
+            // VMStructs 报的偏移在 JDK 25 上取到的是布尔化的值
+            // （private / protected / public 全都读成 0x1），导致 private 被误判成 public。
+            // java.lang.reflect.Method#getModifiers() 走的是 JNI GetMethodModifiers，
+            // 位布局与 Modifier 常量完全一致，跨版本稳定。
+            int targetModifiers = originalM.getModifiers();
             boolean needElevate = hookClazz != originalClazz
-                    && (n.readInt(targetMethod + flagsOffset) & ACC_PUBLIC) == 0;
+                    && (targetModifiers & ACC_PUBLIC) == 0;
             if (needElevate && !allowAccessOverride) {
                 throw new IllegalArgumentException(String.format(
                         "Target method %s.%s is not public; cross-class hooking cannot be done safely ("
@@ -158,6 +274,15 @@ public final class JHookUtils {
 
             long targetConst = n.readPtr(targetMethod + constOffset);
             long hookConst = n.readPtr(hookMethod + constOffset);
+
+            // 同类 hook 不能原地改 hook 方法的 ConstMethod：那样目标方法会和 hook 方法
+            // 共享同一个 ConstMethod，类里出现两个同名同签名的方法，JDK 25 的方法解析
+            // 会直接错乱（实测抛 NoSuchMethodError，指向完全无关的方法）。
+            // 改成复制一份，只改副本。
+            if (hookClazz == originalClazz) {
+                hookConst = n.cloneConstMethod(hookConst);
+            }
+
             int hookNameIndexBefore = n.readU2(hookConst + nameOffset);
 
             // 非 public 跨类：把 hook 方法那份常量池「复制一份」，只把副本的 pool_holder 改成
@@ -505,6 +630,34 @@ public final class JHookUtils {
             throw new IllegalStateException("VMStructs entry not found: " + type + "::" + field);
         }
 
+        /** 列出某个 VMStructs 类型的全部字段（只读诊断，用来确认字段布局）。 */
+        String fieldDump(String type) {
+            StringBuilder out = new StringBuilder();
+            long typeStringOff = -1;
+            try {
+                typeStringOff = readU64Symbol("gHotSpotVMStructEntryTypeStringOffset");
+            } catch (Throwable ignored) {
+                // 某些 JDK 不导出这个符号，退化为只打印名字和偏移
+            }
+            for (int i = 0; i < 200_000; i++) {
+                MemorySegment e = structsBase.asSlice(i * stride, stride);
+                MemorySegment typeName = e.get(ValueLayout.ADDRESS, typeNameOff);
+                if (typeName.equals(MemorySegment.NULL)) {
+                    break;
+                }
+                if (!cstr(typeName).equals(type)) {
+                    continue;
+                }
+                MemorySegment fieldName = e.get(ValueLayout.ADDRESS, fieldNameOff);
+                out.append(cstr(fieldName));
+                if (typeStringOff >= 0) {
+                    out.append(':').append(cstr(e.get(ValueLayout.ADDRESS, typeStringOff)));
+                }
+                out.append('@').append(e.get(ValueLayout.JAVA_LONG, offsetOff)).append("  ");
+            }
+            return out.toString();
+        }
+
         // ---------- Method* ----------
 
         /**
@@ -522,6 +675,105 @@ public final class JHookUtils {
                 return readPtr(methodAddr + offset("Method", "_code")) != 0;
             } catch (Throwable t) {
                 return false;
+            }
+        }
+
+        /**
+         * 丢弃一个方法已编译的代码：{@code _code = 0}，且把 {@code _from_compiled_entry}
+         * 指回 {@code _i2i_entry}。
+         *
+         * <p>i2i adapter 每次调用都会重新读 {@code _constMethod}，所以之后调用会看到我们换上去的
+         * 字节码。局限：已经把这个方法内联进去的调用方不会因此失效，那需要 VM 级 deopt。</p>
+         */
+        void releaseCompiledCode(long methodAddr) {
+            try {
+                writePtr(methodAddr + offset("Method", "_code"), 0);
+            } catch (Throwable t) {
+                Constants.LOG.debug("[JHook] cannot clear Method::_code", t);
+            }
+            try {
+                long i2i = readPtr(methodAddr + offset("Method", "_i2i_entry"));
+                writePtr(methodAddr + offset("Method", "_from_compiled_entry"), i2i);
+            } catch (Throwable t) {
+                Constants.LOG.debug("[JHook] cannot reset Method::_from_compiled_entry", t);
+            }
+        }
+
+        /**
+         * 把一个 {@link cn.ksmcbrigade.jhookmod.utils.hook.JHookUtils} {@code ConstMethod}
+         * 复制到原生内存，返回副本地址。
+         *
+         * <p>大小取自 {@code ConstMethod::_constMethod_size}（字数），所以字节码等尾部数组
+         * 会一起被复制；副本与原对象字节一致，只有我们主动改的字段不同。</p>
+         */
+        long cloneConstMethod(long constMethod) throws Throwable {
+            int words = readInt(constMethod + offset("ConstMethod", "_constMethod_size"));
+            if (words <= 0 || words > 65_536) {
+                throw new IllegalStateException("unexpected ConstMethod size: " + words);
+            }
+            long bytes = words * 8L;
+            MemorySegment source = MemorySegment.ofAddress(constMethod).reinterpret(bytes);
+            MemorySegment copy = ARENA.allocate(bytes, 8);
+            MemorySegment.copy(source, 0, copy, 0, bytes);
+            return copy.address();
+        }
+
+        /** 待捕获的类（内部名），由 retransform 触发回调时消费。 */
+        private static final java.util.Set<String> PENDING_REDEFINE =
+                java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+        /**
+         * 在 {@code ClassFileLoadHook} 回调里被调用：此时 handle 仍属于 VM 的回调帧，
+         * 提升为全局引用是合法的。
+         */
+        void onRedefine(String internalName, long jclass) {
+            if (!PENDING_REDEFINE.remove(internalName)) {
+                return;
+            }
+            try {
+                MemorySegment global = newGlobalRef(MemorySegment.ofAddress(jclass));
+                if (!global.equals(MemorySegment.NULL)) {
+                    CLASS_REFS.put("L" + internalName + ";", global);
+                }
+            } catch (Throwable t) {
+                Constants.LOG.debug("[JHook] capture of {} failed", internalName, t);
+            }
+        }
+
+        /**
+         * 只读探针：在 {@code jvmtiEnv} 内存里定位 {@code jvmtiCapabilities} 位域块。
+         *
+         * <p>思路：我们已经成功添加过 {@code can_get_constant_pool}（bit 35 → byte 4 的 0x08）
+         * 和 {@code can_retransform_classes}（bit 37 → byte 4 的 0x20），所以该块的第 4 个字节
+         * 应该是 {@code 0x28}。用它当特征扫描，命中位置减 4 就是块基址。</p>
+         */
+        void probeCapabilities() {
+            try {
+                int window = 512;
+                MemorySegment env = MemorySegment.ofAddress(jvmtiEnv.address()).reinterpret(window);
+                StringBuilder hex = new StringBuilder();
+                for (int i = 0; i < 64; i++) {
+                    hex.append(String.format("%02x", env.get(ValueLayout.JAVA_BYTE, i) & 0xFF));
+                    if ((i & 7) == 7) {
+                        hex.append(' ');
+                    }
+                }
+                Constants.LOG.info("[JHookProbe] jvmtiEnv=0x{} head={}",
+                        Long.toHexString(jvmtiEnv.address()), hex);
+
+                StringBuilder hits = new StringBuilder();
+                int total = 0;
+                for (int i = 0; i < window; i++) {
+                    if ((env.get(ValueLayout.JAVA_BYTE, i) & 0xFF) == 0x28) {
+                        total++;
+                        if (hits.length() < 400) {
+                            hits.append(i).append(' ');
+                        }
+                    }
+                }
+                Constants.LOG.info("[JHookProbe] 0x28 landmarks: {} hit(s), byte offsets [{}]", total, hits);
+            } catch (Throwable t) {
+                Constants.LOG.warn("[JHookProbe] capability scan failed", t);
             }
         }
 
@@ -638,8 +890,28 @@ public final class JHookUtils {
                 if (!ensureRetransformCapability()) {
                     return false;
                 }
+                // 优先走 Java Agent：Instrumentation.retransformClasses(Class) 不需要 jclass，
+                // 所以首次查找不必再经过任何跨帧 handle。retransform 期间 ClassFileLoadHook
+                // 会用 VM 回调帧里的有效 jclass 把该类的全局引用存进 CLASS_REFS。
+                java.lang.instrument.Instrumentation agent = AgentUtils.getInst();
+                if(agent==null) agent = AgentUtils.injectTmpAgent();
+                if (agent != null) {
+                    PENDING_REDEFINE.add(clazz.getName().replace('.', '/'));
+                    cn.ksmcbrigade.jhookmod.utils.ffm.FFMUtils.REDEFINE_SINK = this::onRedefine;
+                    try {
+                        agent.retransformClasses(clazz);
+                        return true;
+                    } catch (Throwable t) {
+                        Constants.LOG.debug("[JHook] agent retransform failed for {}", clazz.getName(), t);
+                    }
+                }
+
                 MemorySegment jclass = findLoadedClass("L" + clazz.getName().replace('.', '/') + ";");
                 MemorySegment classes = ARENA.allocate(P);
+                // 下一次 retransform 时，让 ClassFileLoadHook 回调把这个类提升为全局引用，
+                // 这样 findLoadedClass 之后就不必再走任何跨帧 handle 的路径。
+                cn.ksmcbrigade.jhookmod.utils.ffm.FFMUtils.REDEFINE_SINK = this::onRedefine;
+                PENDING_REDEFINE.add(clazz.getName().replace('.', '/'));
                 classes.set(ValueLayout.ADDRESS, 0, jclass);
 
                 MethodHandle retransform = LINKER.downcallHandle(
@@ -893,7 +1165,33 @@ public final class JHookUtils {
 
         // ---------- 类查找 ----------
 
+        /**
+         * 已解析的 <b>全局</b> jclass 引用，按类签名缓存。
+         *
+         * <p>为什么必须是全局引用：{@code GetLoadedClasses} 返回的每个 jclass 都是**当前原生调用**
+         * 的 JNI 局部引用，而 FFM 的每次 {@code invokeExact} 都是一次独立的原生入口，
+         * 返回时局部帧就没了。把这个局部引用存下来下次再用，就是踩悬空 handle
+         * （26.2 上表现为 {@code jvmti_GetClassSignature} 里 {@code oopDesc::is_a} 崩溃）。
+         * {@code NewGlobalRef} 出来的引用由 VM 永久持有，跨调用始终有效。</p>
+         */
+        private static final Map<String, MemorySegment> CLASS_REFS = new ConcurrentHashMap<>();
+
         private MemorySegment findLoadedClass(String wantedSignature) throws Throwable {
+            MemorySegment cached = CLASS_REFS.get(wantedSignature);
+            if (cached != null) {
+                return cached;
+            }
+
+            // 优先走 jniEnv->FindClass：它只创建一个 handle，而且紧接着就被提升为全局引用，
+            // 悬空窗口只有一次下行调用。原来的全量扫描要为上万个已加载类创建局部引用，
+            // 那些引用要跨上千次调用使用，是本模块唯一的高风险路径。
+            String internalName = wantedSignature.substring(1, wantedSignature.length() - 1);
+            MemorySegment viaJni = findClassViaJni(internalName);
+            if (viaJni != null) {
+                CLASS_REFS.put(wantedSignature, viaJni);
+                return viaJni;
+            }
+
             MethodHandle getLoaded = LINKER.downcallHandle(
                     jvmtiTable.get(ValueLayout.ADDRESS, JVMTI_GET_LOADED_CLASSES * P),
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
@@ -922,10 +1220,57 @@ public final class JHookUtils {
                 }
                 MemorySegment sig = sigSeg.get(ValueLayout.ADDRESS, 0);
                 if (!sig.equals(MemorySegment.NULL) && cstr(sig).equals(wantedSignature)) {
-                    return klass;
+                    // 立刻提升为全局引用：局部引用在本次下行调用返回后就失效了
+                    MemorySegment global = newGlobalRef(klass);
+                    if (global.equals(MemorySegment.NULL)) {
+                        throw new IllegalStateException("NewGlobalRef failed for " + wantedSignature);
+                    }
+                    CLASS_REFS.put(wantedSignature, global);
+                    return global;
                 }
             }
             throw new IllegalStateException("Loaded class not found: " + wantedSignature);
+        }
+
+        /** {@code FindClass}：JNI 函数表索引 6；失败会挂起异常，必须清掉。 */
+        private MemorySegment findClassViaJni(String internalName) {
+            try {
+                MethodHandle find = LINKER.downcallHandle(
+                        jniTable.get(ValueLayout.ADDRESS, 6 * P),
+                        FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                MemorySegment local = (MemorySegment) find.invokeExact(
+                        jniEnv, ARENA.allocateFrom(internalName));
+                if (local.equals(MemorySegment.NULL)) {
+                    clearPendingException();
+                    return null;
+                }
+                // 立刻提升为全局引用：局部引用在本次下行调用返回后就会失效
+                MemorySegment global = newGlobalRef(local);
+                return global.equals(MemorySegment.NULL) ? null : global;
+            } catch (Throwable t) {
+                clearPendingException();
+                return null;
+            }
+        }
+
+        /** {@code ExceptionClear}：JNI 函数表索引 17。留着挂起异常会让后续 JNI 调用全部失败。 */
+        private void clearPendingException() {
+            try {
+                MethodHandle clear = LINKER.downcallHandle(
+                        jniTable.get(ValueLayout.ADDRESS, 17 * P),
+                        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+                clear.invokeExact(jniEnv);
+            } catch (Throwable ignored) {
+                // 尽力而为
+            }
+        }
+
+        /** {@code NewGlobalRef}：JNI 函数表索引 21，返回跨调用永久有效的引用。 */
+        private MemorySegment newGlobalRef(MemorySegment localRef) throws Throwable {
+            MethodHandle handle = LINKER.downcallHandle(
+                    jniTable.get(ValueLayout.ADDRESS, 21 * P),
+                    FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+            return (MemorySegment) handle.invokeExact(jniEnv, localRef);
         }
 
         // ---------- 引导 ----------
