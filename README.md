@@ -53,7 +53,7 @@ JHookMod 是一个基于 FFM-API 实现的 Hook 库.不修改类字节码,可以
 - 不使用 JavaAgent
 - 动态启用 NativeAccess
 - 使用 FFM-API 模拟实现 JVMTIAgent
-## 需求:
+## 环境需要:
 - JDK 22 (for Minecraft 1.21.x)
 - JDK 25 (for Minecraft 26.x)
 ## 支持版本:
