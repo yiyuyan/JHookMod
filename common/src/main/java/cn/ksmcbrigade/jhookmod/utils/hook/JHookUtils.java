@@ -1,7 +1,6 @@
 package cn.ksmcbrigade.jhookmod.utils.hook;
 
 import cn.ksmcbrigade.jhookmod.Constants;
-import cn.ksmcbrigade.jhookmod.utils.agent.AgentUtils;
 import cn.ksmcbrigade.jhookmod.utils.agent.UnsafeUtils;
 
 import java.lang.foreign.Arena;
@@ -51,38 +50,6 @@ public final class JHookUtils {
     private static final int ACC_PROTECTED = 0x0004;
 
     private static final Map<String, HookRecord> RECORDS = new ConcurrentHashMap<>();
-
-    private static boolean instrumentationTried;
-    private static volatile java.lang.instrument.Instrumentation instrumentation;
-
-    /**
-     * Lazily obtains an {@link java.lang.instrument.Instrumentation} from a generated temp agent.
-     *
-     * <p>Why it matters: {@code Instrumentation.retransformClasses(Class...)} takes {@code Class}
-     * objects, so triggering a retransform no longer needs a {@code jclass}. That is what lets us
-     * break the circular dependency "retransform needs a handle, the safe handle needs a
-     * retransform".</p>
-     */
-    static java.lang.instrument.Instrumentation instrumentation() {
-        if (instrumentationTried) {
-            return instrumentation;
-        }
-        synchronized (JHookUtils.class) {
-            if (instrumentationTried) {
-                return instrumentation;
-            }
-            instrumentationTried = true;
-            try {
-                instrumentation = cn.ksmcbrigade.jhookmod.utils.agent.AgentUtils.injectTmpAgent();
-                Constants.LOG.info("[JHook] Instrumentation acquired: {}", instrumentation != null);
-            } catch (Throwable t) {
-                Constants.LOG.warn("[JHook] failed to acquire Instrumentation; "
-                        + "falling back to the JVMTI retransform path", t);
-                instrumentation = null;
-            }
-        }
-        return instrumentation;
-    }
 
     /** 关闭 deopt 的排查开关：{@code -Djhook.noDeopt=true}。 */
     private static final boolean DEOPT = !Boolean.getBoolean("jhook.noDeopt");
@@ -881,37 +848,32 @@ public final class JHookUtils {
         /**
          * 让 JVM 丢弃这个类的已编译代码，并 deoptimize 所有依赖它的内联决策。
          *
-         * <p>用 JVMTI {@code RetransformClasses} 实现：我们注册的 {@code ClassFileLoadHook}
-         * 不改字节码（没有转换器就直接返回），所以类内容不变；但 JVM 会把类里的方法标记为
-         * old 并让依赖方失效，于是 <b>被 JIT 内联过的调用点会重新解析</b>，从而看到新装的 Hook。</p>
+         * <p>用 JVMTI {@code RetransformClasses}（函数表下标 151）实现：我们注册的
+         * {@code ClassFileLoadHook} 不改字节码（没有转换器就直接返回），所以类内容不变；但 JVM 会把
+         * 类里的方法标记为 old 并让依赖方失效，于是 <b>被 JIT 内联过的调用点会重新解析</b>，
+         * 从而看到新装的 Hook。</p>
+         *
+         * <p>临时 Java Agent 的链路已删除：{@code Instrumentation.retransformClasses(Class...)}
+         * 需要 {@code Class} 对象，本质上也是走 JVMTI，只是多了一次生成/加载 agent jar 的开销。
+         * 这里直接用本类已经持有的 JVMTI 环境调用 {@code RetransformClasses}，jclass 来自
+         * {@code Natives#findLoadedClass} 缓存的全局引用，跨原生调用不会失效。</p>
+         *
+         * <p>能力申请顺序：{@code can_retransform_classes} 必须在<b>同一个 JVMTI 环境</b>启用
+         * {@code ClassFileLoadHook} 之前添加，否则 HotSpot 会返回
+         * {@code JVMTI_ERROR_NOT_AVAILABLE}。本类的环境只做 retransform / 常量池查询，
+         * {@code ClassFileLoadHook} 由 {@code FFMUtils} 在另一个环境里启用，所以这里能正常成功。</p>
          */
         boolean deoptimize(Class<?> clazz) {
             try {
                 if (!ensureRetransformCapability()) {
                     return false;
                 }
-                // 优先走 Java Agent：Instrumentation.retransformClasses(Class) 不需要 jclass，
-                // 所以首次查找不必再经过任何跨帧 handle。retransform 期间 ClassFileLoadHook
-                // 会用 VM 回调帧里的有效 jclass 把该类的全局引用存进 CLASS_REFS。
-                java.lang.instrument.Instrumentation agent = AgentUtils.getInst();
-                if(agent==null) agent = AgentUtils.injectTmpAgent();
-                if (agent != null) {
-                    PENDING_REDEFINE.add(clazz.getName().replace('.', '/'));
-                    cn.ksmcbrigade.jhookmod.utils.ffm.FFMUtils.REDEFINE_SINK = this::onRedefine;
-                    try {
-                        agent.retransformClasses(clazz);
-                        return true;
-                    } catch (Throwable t) {
-                        Constants.LOG.debug("[JHook] agent retransform failed for {}", clazz.getName(), t);
-                    }
-                }
-
-                MemorySegment jclass = findLoadedClass("L" + clazz.getName().replace('.', '/') + ";");
+                String internalName = clazz.getName().replace('.', '/');
+                MemorySegment jclass = findLoadedClass("L" + internalName + ";");
                 MemorySegment classes = ARENA.allocate(P);
-                // 下一次 retransform 时，让 ClassFileLoadHook 回调把这个类提升为全局引用，
-                // 这样 findLoadedClass 之后就不必再走任何跨帧 handle 的路径。
+                // 让 retransform 期间触发的 ClassFileLoadHook 回调把这个类提升为全局引用。
                 cn.ksmcbrigade.jhookmod.utils.ffm.FFMUtils.REDEFINE_SINK = this::onRedefine;
-                PENDING_REDEFINE.add(clazz.getName().replace('.', '/'));
+                PENDING_REDEFINE.add(internalName);
                 classes.set(ValueLayout.ADDRESS, 0, jclass);
 
                 MethodHandle retransform = LINKER.downcallHandle(
@@ -920,7 +882,8 @@ public final class JHookUtils {
                                 ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
                 int rc = (int) retransform.invokeExact(jvmtiEnv, 1, classes);
                 if (rc != 0) {
-                    Constants.LOG.debug("[JHook] RetransformClasses({}) rc={}", clazz.getSimpleName(), rc);
+                    Constants.LOG.warn("[JHook] RetransformClasses({}) rc={}; "
+                            + "already compiled call sites may ignore the hook", clazz.getSimpleName(), rc);
                     return false;
                 }
                 return true;
@@ -1182,16 +1145,10 @@ public final class JHookUtils {
                 return cached;
             }
 
-            // 优先走 jniEnv->FindClass：它只创建一个 handle，而且紧接着就被提升为全局引用，
-            // 悬空窗口只有一次下行调用。原来的全量扫描要为上万个已加载类创建局部引用，
-            // 那些引用要跨上千次调用使用，是本模块唯一的高风险路径。
-            String internalName = wantedSignature.substring(1, wantedSignature.length() - 1);
-            MemorySegment viaJni = findClassViaJni(internalName);
-            if (viaJni != null) {
-                CLASS_REFS.put(wantedSignature, viaJni);
-                return viaJni;
-            }
-
+            // 只用 JVMTI GetLoadedClasses 扫描来取句柄。
+            // 不能用 JNI FindClass：它返回的 jclass 是那次 downcall 的局部引用，跨下行调用后
+            // 已失效/被复用（实测 java.lang.System 会被解析成 [B），随后 GetMethodID/
+            // GetStaticMethodID 直接让 JVM 崩溃。
             MethodHandle getLoaded = LINKER.downcallHandle(
                     jvmtiTable.get(ValueLayout.ADDRESS, JVMTI_GET_LOADED_CLASSES * P),
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
@@ -1230,39 +1187,6 @@ public final class JHookUtils {
                 }
             }
             throw new IllegalStateException("Loaded class not found: " + wantedSignature);
-        }
-
-        /** {@code FindClass}：JNI 函数表索引 6；失败会挂起异常，必须清掉。 */
-        private MemorySegment findClassViaJni(String internalName) {
-            try {
-                MethodHandle find = LINKER.downcallHandle(
-                        jniTable.get(ValueLayout.ADDRESS, 6 * P),
-                        FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-                MemorySegment local = (MemorySegment) find.invokeExact(
-                        jniEnv, ARENA.allocateFrom(internalName));
-                if (local.equals(MemorySegment.NULL)) {
-                    clearPendingException();
-                    return null;
-                }
-                // 立刻提升为全局引用：局部引用在本次下行调用返回后就会失效
-                MemorySegment global = newGlobalRef(local);
-                return global.equals(MemorySegment.NULL) ? null : global;
-            } catch (Throwable t) {
-                clearPendingException();
-                return null;
-            }
-        }
-
-        /** {@code ExceptionClear}：JNI 函数表索引 17。留着挂起异常会让后续 JNI 调用全部失败。 */
-        private void clearPendingException() {
-            try {
-                MethodHandle clear = LINKER.downcallHandle(
-                        jniTable.get(ValueLayout.ADDRESS, 17 * P),
-                        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
-                clear.invokeExact(jniEnv);
-            } catch (Throwable ignored) {
-                // 尽力而为
-            }
         }
 
         /** {@code NewGlobalRef}：JNI 函数表索引 21，返回跨调用永久有效的引用。 */

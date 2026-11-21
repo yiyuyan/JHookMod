@@ -39,8 +39,10 @@ public class CommonClass {
         //         "createTitleHookTest", new Class<?>[0], false);
 
         // 实验：createTitle 是 private 实例方法，走 hookNonPublic（常量池副本方案）。
-        installHook(Minecraft.class, "createTitle", new Class<?>[0],
-                "createTitleHookTestStr", new Class<?>[0], true);
+        if(!Services.PLATFORM.getPlatformName().toLowerCase().contains("fabric") || Services.PLATFORM.isDevelopmentEnvironment()){
+            installHook(Minecraft.class, "createTitle", new Class<?>[0],
+                    "createTitleHookTestStr", new Class<?>[0], true);
+        }
 
         // 关于 createTitle（private 实例方法）的实验结论，需要时把下面这段放开：
         //   installHook(Minecraft.class, "createTitle", new Class<?>[0],
@@ -69,11 +71,11 @@ public class CommonClass {
 
     /**
      * 与 {@code System.exit(int)} 同描述符、同为 static。
-     * <p>跨类拿不到原版实现，所以直接用 {@code halt(114514)} 达成「强制以 114514 退出」。</p>
+     * <p>跨类拿不到原版实现，所以直接用 {@code halt(0)} 达成「强制以 0 退出」。</p>
      */
     public static void exitForceZero(int status) {
-        Constants.LOG.info("[JHook] System.exit({}) rewritten to Runtime.halt(114514)", status);
-        Runtime.getRuntime().halt(114514);
+        Constants.LOG.info("[JHook] System.exit({}) rewritten to Runtime.halt(0)", status);
+        Runtime.getRuntime().halt(0);
     }
 
     /**

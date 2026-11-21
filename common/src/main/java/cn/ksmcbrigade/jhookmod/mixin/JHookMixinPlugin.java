@@ -2,7 +2,6 @@ package cn.ksmcbrigade.jhookmod.mixin;
 
 import cn.ksmcbrigade.jhookmod.Constants;
 import cn.ksmcbrigade.jhookmod.platform.Services;
-import cn.ksmcbrigade.jhookmod.utils.agent.AgentUtils;
 import cn.ksmcbrigade.jhookmod.utils.agent.UnsafeUtils;
 import cn.ksmcbrigade.jhookmod.utils.ffm.FFMUtils;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
@@ -15,11 +14,6 @@ public class JHookMixinPlugin implements IMixinConfigPlugin {
 
     static {
 
-        try {
-            Constants.LOG.info("JavaAgent injected: {}",AgentUtils.injectTmpAgent());
-        } catch (Throwable e) {
-            Constants.LOG.error("Failed to inject JavaAgent for FFM", e);
-        }
         try {
             UnsafeUtils.enableNativeAccess(Constants.LOG);
         } catch (Throwable e) {
