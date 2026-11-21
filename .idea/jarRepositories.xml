@@ -81,5 +81,20 @@
       <option name="name" value="LoomGlobalMinecraft" />
       <option name="url" value="file:/$USER_HOME$/.gradle/caches/fabric-loom/minecraftMaven/" />
     </remote-repository>
+    <remote-repository>
+      <option name="id" value="LocalMinecraftLibraries" />
+      <option name="name" value="LocalMinecraftLibraries" />
+      <option name="url" value="file:/$PROJECT_DIR$/../../.local-mc-repo/" />
+    </remote-repository>
+    <remote-repository>
+      <option name="id" value="AliyunProjectMirror" />
+      <option name="name" value="AliyunProjectMirror" />
+      <option name="url" value="https://maven.aliyun.com/repository/public" />
+    </remote-repository>
+    <remote-repository>
+      <option name="id" value="TencentProjectMirror" />
+      <option name="name" value="TencentProjectMirror" />
+      <option name="url" value="https://mirrors.cloud.tencent.com/nexus/repository/maven-public/" />
+    </remote-repository>
   </component>
 </project>

@@ -1,5 +1,6 @@
 package cn.ksmcbrigade.jhookmod.utils.hook;
 
+import cn.ksmcbrigade.jhookmod.CommonClass;
 import cn.ksmcbrigade.jhookmod.Constants;
 import cn.ksmcbrigade.jhookmod.utils.agent.UnsafeUtils;
 
@@ -166,13 +167,13 @@ public final class JHookUtils {
     }
 
     /**
-     * 同 {@link #hook}，额外把 {@code originalM} 的<b>原始实现</b>搬到 {@code backupM} 上，
+     * 同 {@link #hookPublic}，额外把 {@code originalM} 的<b>原始实现</b>搬到 {@code backupM} 上，
      * 这样 hook 内部可以调用 {@code backupM} 来执行原版逻辑（环绕钩子）。
      *
      * <p><b>注意</b>：这个模式需要改写目标方法自己的 {@code ConstMethod}（把名字让给 backup），
      * 实测在部分 JVM 运行中会被解析器拒绝。本方法会在落笔后校验，
      * 失败时<b>自动回滚并抛异常</b>，不会留下损坏的类。对可靠性要求高的场景请用
-     * {@link #hook}。</p>
+     * {@link #hookPublic}。</p>
      *
      * @param backupClazz 备份方法所在的类（可为 {@code null}）
      * @param backupM     承接原始实现的方法；描述符必须与 {@code originalM} 一致
@@ -366,7 +367,7 @@ public final class JHookUtils {
     }
 
     /**
-     * 还原一次 {@link #hook}。
+     * 还原一次 {@link #hookPublic}。
      *
      * @return 是否成功还原（没有记录时返回 {@code false}）
      */
@@ -506,6 +507,7 @@ public final class JHookUtils {
         // JNINativeInterface_ 下标（由 include/jni.h 解析得到）
         private static final int JNI_GET_METHOD_ID = 33;
         private static final int JNI_GET_STATIC_METHOD_ID = 113;
+        private static final int JNI_CALL_INT_METHOD_A = 51;
         private static final int JNI_TABLE_SLOTS = 235;
 
         private static final Linker LINKER = Linker.nativeLinker();
@@ -746,7 +748,7 @@ public final class JHookUtils {
 
         /** 取原始 jmethodID（未解引用），供 JVMTI 断点接口使用。 */
         long rawMethodId(Class<?> clazz, Method method) throws Throwable {
-            MemorySegment jclass = findLoadedClass("L" + clazz.getName().replace('.', '/') + ";");
+            MemorySegment jclass = findLoadedClass(clazz);
             boolean isStatic = Modifier.isStatic(method.getModifiers());
             int index = isStatic ? JNI_GET_STATIC_METHOD_ID : JNI_GET_METHOD_ID;
 
@@ -754,10 +756,33 @@ public final class JHookUtils {
                     jniTable.get(ValueLayout.ADDRESS, index * P),
                     FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                             ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-            MemorySegment id = (MemorySegment) lookup.invokeExact(jniEnv, jclass,
-                    ARENA.allocateFrom(method.getName()),
-                    ARENA.allocateFrom(descriptor(method)));
+            MemorySegment id;
+            try {
+                id = (MemorySegment) lookup.invokeExact(jniEnv, jclass,
+                        ARENA.allocateFrom(method.getName()),
+                        ARENA.allocateFrom(descriptor(method)));
+            } catch (Throwable failure) {
+                // JNI GetMethodID 失败会把挂起异常留给 FFM 直接抛进 Java，这里必须清掉，
+                // 否则同一线程后续的 JNI 调用都会失败。
+                clearPendingException();
+                StringBuilder names = new StringBuilder();
+                for (Method m : clazz.getDeclaredMethods()) {
+                    names.append(m.getName()).append(' ');
+                }
+                Constants.LOG.warn("[JHook] GetMethodID threw {} for {}.{}{} classHash={} jclassHash={} methods=[{}]",
+                        failure.toString(), clazz.getName(), method.getName(), descriptor(method),
+                        System.identityHashCode(clazz), classIdentityHash(jclass), names);
+                throw failure;
+            }
             if (id.equals(MemorySegment.NULL)) {
+                clearPendingException();
+                StringBuilder names = new StringBuilder();
+                for (Method m : clazz.getDeclaredMethods()) {
+                    names.append(m.getName()).append(' ');
+                }
+                Constants.LOG.warn("[JHook] GetMethodID failed: {}.{}{} classHash={} jclassHash={} methods=[{}]",
+                        clazz.getName(), method.getName(), descriptor(method),
+                        System.identityHashCode(clazz), classIdentityHash(jclass), names);
                 throw new IllegalStateException("Method not found: " + clazz.getName() + "#" + method.getName());
             }
             return id.address();
@@ -869,7 +894,7 @@ public final class JHookUtils {
                     return false;
                 }
                 String internalName = clazz.getName().replace('.', '/');
-                MemorySegment jclass = findLoadedClass("L" + internalName + ";");
+                MemorySegment jclass = findLoadedClass(clazz);
                 MemorySegment classes = ARENA.allocate(P);
                 // 让 retransform 期间触发的 ClassFileLoadHook 回调把这个类提升为全局引用。
                 cn.ksmcbrigade.jhookmod.utils.ffm.FFMUtils.REDEFINE_SINK = this::onRedefine;
@@ -1025,7 +1050,7 @@ public final class JHookUtils {
             if (!ensureConstantPoolCapability()) {
                 return -1;
             }
-            MemorySegment jclass = findLoadedClass("L" + clazz.getName().replace('.', '/') + ";");
+            MemorySegment jclass = findLoadedClass(clazz);
             MethodHandle getPool = LINKER.downcallHandle(
                     jvmtiTable.get(ValueLayout.ADDRESS, JVMTI_GET_CONSTANT_POOL * P),
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
@@ -1139,12 +1164,52 @@ public final class JHookUtils {
          */
         private static final Map<String, MemorySegment> CLASS_REFS = new ConcurrentHashMap<>();
 
+        /** 按 {@link Class} 对象缓存 jclass：同名类可能有多个 classloader 副本。 */
+        private static final Map<Class<?>, MemorySegment> CLASS_REFS_BY_CLASS = new ConcurrentHashMap<>();
+
+        /** {@code java.lang.Object.hashCode()I}，用于比较 {@code Class} 对象的身份哈希。 */
+        private static volatile MemorySegment objectHashCodeMethodId;
+
         private MemorySegment findLoadedClass(String wantedSignature) throws Throwable {
             MemorySegment cached = CLASS_REFS.get(wantedSignature);
             if (cached != null) {
                 return cached;
             }
+            MemorySegment global = scanLoadedClass(wantedSignature, false, 0);
+            if (global == null) {
+                throw new IllegalStateException("Loaded class not found: " + wantedSignature);
+            }
+            CLASS_REFS.put(wantedSignature, global);
+            return global;
+        }
 
+        /**
+         * 按 {@link Class} 对象取 jclass，而不是只按类名。
+         *
+         * <p>同名类可能被不同 classloader 各加载一份（Fabric/NeoForge 的 transform/remap 下实测存在），
+         * 只按签名扫描会随机拿到另一份，随后 {@code GetMethodID} 报
+         * {@code NoSuchMethodError}。这里用 {@code System.identityHashCode(clazz)} 与候选
+         * {@code Class} 对象的身份哈希比对，确保拿到的是传入的那个类。</p>
+         */
+        private MemorySegment findLoadedClass(Class<?> clazz) throws Throwable {
+            MemorySegment cached = CLASS_REFS_BY_CLASS.get(clazz);
+            if (cached != null) {
+                return cached;
+            }
+            String wantedSignature = "L" + clazz.getName().replace('.', '/') + ";";
+            MemorySegment global = scanLoadedClass(wantedSignature, true, System.identityHashCode(clazz));
+            if (global == null) {
+                throw new IllegalStateException("Loaded class not found: " + wantedSignature);
+            }
+            CLASS_REFS_BY_CLASS.put(clazz, global);
+            return global;
+        }
+
+        /**
+         * 扫描所有已加载类；{@code checkIdentity} 时只返回身份哈希匹配的那个（找不到再退回第一个同名类）。
+         */
+        private MemorySegment scanLoadedClass(String wantedSignature, boolean checkIdentity, int wantedHash)
+                throws Throwable {
             // 只用 JVMTI GetLoadedClasses 扫描来取句柄。
             // 不能用 JNI FindClass：它返回的 jclass 是那次 downcall 的局部引用，跨下行调用后
             // 已失效/被复用（实测 java.lang.System 会被解析成 [B），随后 GetMethodID/
@@ -1168,6 +1233,7 @@ public final class JHookUtils {
             MemorySegment sigSeg = ARENA.allocate(ValueLayout.ADDRESS);
             MemorySegment genSeg = ARENA.allocate(ValueLayout.ADDRESS);
 
+            MemorySegment fallback = null;
             for (int i = 0; i < count; i++) {
                 MemorySegment klass = classes.get(ValueLayout.ADDRESS, i * P);
                 sigSeg.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
@@ -1176,22 +1242,74 @@ public final class JHookUtils {
                     continue;
                 }
                 MemorySegment sig = sigSeg.get(ValueLayout.ADDRESS, 0);
-                if (!sig.equals(MemorySegment.NULL) && cstr(sig).equals(wantedSignature)) {
-                    // 立刻提升为全局引用：局部引用在本次下行调用返回后就失效了
-                    MemorySegment global = newGlobalRef(klass);
-                    if (global.equals(MemorySegment.NULL)) {
-                        throw new IllegalStateException("NewGlobalRef failed for " + wantedSignature);
-                    }
-                    CLASS_REFS.put(wantedSignature, global);
+                if (sig.equals(MemorySegment.NULL) || !cstr(sig).equals(wantedSignature)) {
+                    continue;
+                }
+                // 立刻提升为全局引用：局部引用在本次下行调用返回后就失效了
+                MemorySegment global = newGlobalRef(klass);
+                if (global.equals(MemorySegment.NULL)) {
+                    throw new IllegalStateException("NewGlobalRef failed for " + wantedSignature);
+                }
+                if (!checkIdentity) {
                     return global;
                 }
+                int hash = -1;
+                try {
+                    hash = classIdentityHash(global);
+                } catch (Throwable t) {
+                    Constants.LOG.debug("[JHook] failed to read the identity hash of {}", wantedSignature, t);
+                }
+                if (hash == wantedHash) {
+                    return global;
+                }
+                if (fallback == null) {
+                    fallback = global;
+                }
             }
-            throw new IllegalStateException("Loaded class not found: " + wantedSignature);
+            return fallback;
+        }
+
+        /** 用 JNI 调用 {@code Object.hashCode()}，对 {@code Class} 对象就是身份哈希。 */
+        private int classIdentityHash(MemorySegment classRef) throws Throwable {
+            MemorySegment methodId = objectHashCodeMethodId;
+            if (methodId == null) {
+                MemorySegment objectClass = findLoadedClass("Ljava/lang/Object;");
+                MethodHandle getMethod = LINKER.downcallHandle(
+                        jniTable.get(ValueLayout.ADDRESS, JNI_GET_METHOD_ID * P),
+                        FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                MemorySegment found = (MemorySegment) getMethod.invokeExact(jniEnv, objectClass,
+                        (MemorySegment) ARENA.allocateFrom("hashCode"),
+                        (MemorySegment) ARENA.allocateFrom("()I"));
+                if (found.equals(MemorySegment.NULL)) {
+                    throw new IllegalStateException("Object.hashCode() not found");
+                }
+                objectHashCodeMethodId = found;
+                methodId = found;
+            }
+            MemorySegment args = ARENA.allocate(8);
+            args.fill((byte) 0);
+            MethodHandle call = LINKER.downcallHandle(
+                    jniTable.get(ValueLayout.ADDRESS, JNI_CALL_INT_METHOD_A * P),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+            return (int) call.invokeExact(jniEnv, classRef, methodId, args);
+        }
+
+        /** {@code ExceptionClear}：JNI 函数表索引 17，清理 JNI 失败留下的挂起异常。 */
+        private void clearPendingException() {
+            try {
+                MethodHandle clear = LINKER.downcallHandle(
+                        jniTable.get(ValueLayout.ADDRESS, 17 * P),
+                        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+                clear.invokeExact(jniEnv);
+            } catch (Throwable ignored) {
+                // 尽力而为
+            }
         }
 
         /** {@code NewGlobalRef}：JNI 函数表索引 21，返回跨调用永久有效的引用。 */
-        private MemorySegment newGlobalRef(MemorySegment localRef) throws Throwable {
-            MethodHandle handle = LINKER.downcallHandle(
+        private MemorySegment newGlobalRef(MemorySegment localRef) throws Throwable {            MethodHandle handle = LINKER.downcallHandle(
                     jniTable.get(ValueLayout.ADDRESS, 21 * P),
                     FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
             return (MemorySegment) handle.invokeExact(jniEnv, localRef);
@@ -1327,5 +1445,22 @@ public final class JHookUtils {
         }
         seg.setAtIndex(ValueLayout.JAVA_CHAR, s.length(), (char) 0);
         return seg;
+    }
+
+    public static void tryInstallHook(Class<?> targetClazz, String targetName, Class<?>[] targetParams,
+                                    Class<?> hookClazz,String hookName, Class<?>[] hookParams, boolean nonPublic) {
+        try {
+            Method original = targetClazz.getDeclaredMethod(targetName, targetParams);
+            Method hook = hookClazz.getDeclaredMethod(hookName, hookParams);
+            JHookUtils.probeMethodLayout(targetClazz, original);
+            if (nonPublic) {
+                JHookUtils.hookNonPublic(targetClazz, original,hookClazz, hook);
+            } else {
+                JHookUtils.hookPublic(targetClazz, original, hookClazz, hook);
+            }
+        } catch (Throwable t) {
+            throw new IllegalStateException("[JHook] failed to install the hook on "+
+                    targetClazz.getSimpleName()+" : "+targetName, t);
+        }
     }
 }
