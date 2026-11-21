@@ -379,11 +379,17 @@ public class UnsafeUtils {
                 logger.info("module self {} is native access enabled: {}",module,(boolean) isNativeAccessEnabledHandle.invokeExact(target));
                 logger.info("module target {} is native access enabled: {}",target,(boolean) isNativeAccessEnabledHandle.invokeExact(target));
 
-                Class<?> moduleBoot = Class.forName("jdk.internal.module.ModuleBootstrap");
-                MethodHandle hasEnableNativeAccessFlagHandle = lookup.findStatic(moduleBoot,"hasEnableNativeAccessFlag",MethodType.methodType(boolean.class));
+                // JDK 25 removed ModuleBootstrap.hasEnableNativeAccessFlag(), so keep this
+                // diagnostic block best-effort instead of failing the whole method.
+                try {
+                    Class<?> moduleBoot = Class.forName("jdk.internal.module.ModuleBootstrap");
+                    MethodHandle hasEnableNativeAccessFlagHandle = lookup.findStatic(moduleBoot,"hasEnableNativeAccessFlag",MethodType.methodType(boolean.class));
 
-                logger.info("jdk.internal.module.ModuleBootstrap::HAS_ENABLE_NATIVE_ACCESS_FLAG={}",hasEnableNativeAccessFlagHandle.invoke());
-                logger.info("jdk.internal.module.ModuleBootstrap::NATIVE_ACCESS_MODULES={}", Objects.nonNull(getFieldValue(moduleBoot, "NATIVE_ACCESS_MODULES", Set.class)));
+                    logger.info("jdk.internal.module.ModuleBootstrap::HAS_ENABLE_NATIVE_ACCESS_FLAG={}",hasEnableNativeAccessFlagHandle.invoke());
+                    logger.info("jdk.internal.module.ModuleBootstrap::NATIVE_ACCESS_MODULES={}", Objects.nonNull(getFieldValue(moduleBoot, "NATIVE_ACCESS_MODULES", Set.class)));
+                } catch (Throwable throwable) {
+                    logger.info("jdk.internal.module.ModuleBootstrap native-access diagnostics unavailable on this JDK: {}", throwable.toString());
+                }
             }
             else {
                 throw new IllegalStateException("The MethodHandleLookup is null!");

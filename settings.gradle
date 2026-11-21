@@ -1,6 +1,5 @@
 pluginManagement {
     repositories {
-        gradlePluginPortal()
         mavenCentral()
         exclusiveContent {
             forRepository {
@@ -10,30 +9,27 @@ pluginManagement {
                 }
             }
             filter {
-                includeGroup('net.fabricmc')
-                includeGroup('fabric-loom')
+                includeGroupAndSubgroups('net.fabricmc')
             }
         }
         exclusiveContent {
             forRepository {
                 maven {
-                    name = 'Sponge'
-                    url = uri('https://repo.spongepowered.org/repository/maven-public')
+                    name = 'NeoForge'
+                    url = uri('https://maven.neoforged.net/releases')
                 }
             }
             filter {
-                includeGroupAndSubgroups("org.spongepowered")
+                includeGroupAndSubgroups('net.neoforged')
             }
         }
+        gradlePluginPortal()
     }
-}
-
-plugins {
-    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
 }
 
 // This should match the folder name of the project, or else IDEA may complain (see https://youtrack.jetbrains.com/issue/IDEA-317606)
 rootProject.name = 'JHookMod'
+includeBuild('build-logic')
 include('common')
 include('fabric')
 include('neoforge')

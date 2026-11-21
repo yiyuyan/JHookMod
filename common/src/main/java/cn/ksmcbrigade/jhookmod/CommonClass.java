@@ -7,8 +7,6 @@ import cn.ksmcbrigade.jhookmod.utils.hook.JHookUtils;
 import cn.ksmcbrigade.jhookmod.utils.hook.JHookUtilsSelfTest;
 import net.minecraft.client.Minecraft;
 
-import java.lang.reflect.Method;
-
 public class CommonClass {
 
     public static void init() {
@@ -17,7 +15,8 @@ public class CommonClass {
         Constants.LOG.info("JVMTI ClassFileLoadHook: injected={}, invocations so far={}",
                 FFMUtils.isInjected(), FFMUtils.getHookInvocations());
 
-        if (Services.PLATFORM.isDevelopmentEnvironment() || Boolean.getBoolean("jhook.selftest")) {
+        if ((Services.PLATFORM.isDevelopmentEnvironment() || Boolean.getBoolean("jhook.selftest"))
+                && !Boolean.getBoolean("jhook.noSelftest")) {
             JvmTIAgentTest.hookFooAndTest();
 
             // Repeatable API self-test (visibility matrix, signatures, overloads, JIT, backup...).
@@ -27,45 +26,50 @@ public class CommonClass {
             Constants.LOG.info("[JHook] fresh cross-class call site foo() returned {} -> {}",
                     crossClass, crossClass == 2 ? "PASS" : "FAIL");
 
+            // 例 1：System.exit 改成强制 halt(0)。目标 public static，hook 也必须 static。
+            // 注意：MC 26.2+ 的正常退出路径不再调用 System.exit（只有崩溃路径会调用），
+            // 所以 26.2/26.3 正常退游戏看不到这里的日志，属于游戏行为变化，不是 hook 失效。
+            installHook(System.class, "exit", new Class<?>[]{int.class},
+                    "exitForceZero", new Class<?>[]{int.class}, false);
 
-        }
+            // 例 2：窗口标题。updateTitle 是 public，普通 hook 即可稳定工作。
+            // installHook(Minecraft.class, "updateTitle", new Class<?>[0],
+            //         "createTitleHookTest", new Class<?>[0], false);
 
-        // 例 1：System.exit 改成强制 halt(0)。目标 public static，hook 也必须 static。
-        installHook(System.class, "exit", new Class<?>[]{int.class},
-                "exitForceZero", new Class<?>[]{int.class}, false);
-
-        // 例 2：窗口标题。updateTitle 是 public，普通 hook 即可稳定工作。
-        // installHook(Minecraft.class, "updateTitle", new Class<?>[0],
-        //         "createTitleHookTest", new Class<?>[0], false);
-
-        // 实验：createTitle 是 private 实例方法，走 hookNonPublic（常量池副本方案）。
-        if(!Services.PLATFORM.getPlatformName().toLowerCase().contains("fabric") || Services.PLATFORM.isDevelopmentEnvironment()){
+            // 实验：createTitle 是 private 实例方法，走 hookNonPublic（常量池副本方案）。
             installHook(Minecraft.class, "createTitle", new Class<?>[0],
                     "createTitleHookTestStr", new Class<?>[0], true);
-        }
 
-        // 关于 createTitle（private 实例方法）的实验结论，需要时把下面这段放开：
-        //   installHook(Minecraft.class, "createTitle", new Class<?>[0],
-        //           "createTitleHookTestStr", new Class<?>[0], true);
-        // hookNonPublic 会把 hook 常量池的 pool_holder 改成 Minecraft，从而骗过 private 访问检查
-        // （实测报错点从 createTitle 转移到 hook 自身对 private 成员的访问），但随后 JVM 会
-        // 出现 EXCEPTION_ACCESS_VIOLATION。注意事项见 JHookUtils#hookNonPublic 的注释。
+            // 26.1 Fabric 的窗口标题在 mod 入口之前就已经用原始 createTitle() 算好并传给 Window，
+            // 所以装完 hook 后要主动刷新一次，否则标题会一直是旧值。
+            TitleRefresh.refresh();
+
+            //Test fake exit
+            System.exit(-114514);
+
+            // 关于 createTitle（private 实例方法）的实验结论，需要时把下面这段放开：
+            //   installHook(Minecraft.class, "createTitle", new Class<?>[0],
+            //           "createTitleHookTestStr", new Class<?>[0], true);
+            // hookNonPublic 会把 hook 常量池的 pool_holder 改成 Minecraft，从而骗过 private 访问检查
+            // （实测报错点从 createTitle 转移到 hook 自身对 private 成员的访问），但随后 JVM 会
+            // 出现 EXCEPTION_ACCESS_VIOLATION。注意事项见 JHookUtils#hookNonPublic 的注释。
+        }
     }
 
     private static void installHook(Class<?> targetClazz, String targetName, Class<?>[] targetParams,
                                     String hookName, Class<?>[] hookParams, boolean unsafe) {
         try {
-            Method original = targetClazz.getDeclaredMethod(targetName, targetParams);
+           /* Method original = targetClazz.getDeclaredMethod(targetName, targetParams);
             Method hook = CommonClass.class.getDeclaredMethod(hookName, hookParams);
             JHookUtils.probeMethodLayout(targetClazz, original);
             if (unsafe) {
                 JHookUtils.hookNonPublic(targetClazz, original, CommonClass.class, hook);
             } else {
                 JHookUtils.hookPublic(targetClazz, original, CommonClass.class, hook);
-            }
+            }*/
+            JHookUtils.tryInstallHook(targetClazz,targetName,targetParams, CommonClass.class,hookName,hookParams,unsafe);
         } catch (Throwable t) {
-            Constants.LOG.error("[JHook] failed to install the hook on {}.{}: {}",
-                    targetClazz.getSimpleName(), targetName, t.toString());
+            Constants.LOG.error("Failed to install hook.",t);
         }
     }
 
@@ -74,6 +78,10 @@ public class CommonClass {
      * <p>跨类拿不到原版实现，所以直接用 {@code halt(0)} 达成「强制以 0 退出」。</p>
      */
     public static void exitForceZero(int status) {
+        if(status==-114514) {
+            Constants.LOG.info("Test exit:-114514 won't exit.");
+            return;
+        }
         Constants.LOG.info("[JHook] System.exit({}) rewritten to Runtime.halt(0)", status);
         Runtime.getRuntime().halt(0);
     }
@@ -90,10 +98,11 @@ public class CommonClass {
 
     /**
      * 若要试 {@code createTitle()}（返回 {@code String}），用这个方法做 hook 体。
-     * <p>走 {@code hookUnsafe} 时 hook 的常量池 pool_holder 会被改成目标类，
+     * <p>走 {@code hookNonPyblic} 时 hook 的常量池 pool_holder 会被改成目标类，
      * 因此方法体<b>只能引用 public 成员或编译期常量</b>——这里的常量会被内联成 {@code ldc}。</p>
      */
     public String createTitleHookTestStr() {
+        Constants.LOG.info("[JHookDemo] hooked createTitle() called");
         return "JHook: hooked createTitle";
     }
 }

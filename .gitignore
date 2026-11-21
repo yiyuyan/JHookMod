@@ -1,11 +1,16 @@
-# 项目排除路径
+# Gradle / build outputs
 /.gradle/
+/build/
+/build-logic/.gradle/
+/build-logic/build/
 /buildSrc/.gradle/
 /buildSrc/build/
-/buildSrc/build/classes/java/main/
 /common/build/
-/common/build/classes/java/main/
-/fabric/.gradle/
 /fabric/build/
 /neoforge/build/
-/neoforge/build/classes/java/main/
+/fabric/.gradle/
+/neoforge/.gradle/
+
+# Loader dev run directories
+/fabric/runs/
+/neoforge/runs/
