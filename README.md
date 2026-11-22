@@ -12,8 +12,8 @@ JHookMod is a Hook library implemented based on FFM-API. Without modifying the c
 - JDK 25 (for Minecraft 26.x)
 ## Supported Versions:
 - Fabric 1.21 ~ 26.x
-NeoForge 1.21.1 ~ 26.x (does not support 1.21)
-Warning: This library has modified a large number of internal structures of the JVM. Even after numerous tests in various scenarios, it may still cause instability or crashes of the JVM.
+- NeoForge 1.21.1 ~ 26.x (does not support 1.21)
+### Warning: This library has modified a large number of internal structures of the JVM. Even after numerous tests in various scenarios, it may still cause instability or crashes of the JVM.
 
 ## Usage Method
 
